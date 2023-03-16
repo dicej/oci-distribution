@@ -5,6 +5,9 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
+/// Time in seconds prior to expiration when we should refresh auth.
+const EXPIRATION_BUFFER_SECONDS: u64 = 30;
+
 /// A token granted during the OAuth2-like workflow for OCI registries.
 #[derive(Deserialize, Clone)]
 #[serde(untagged)]
@@ -133,7 +136,7 @@ impl TokenCache {
                     .duration_since(UNIX_EPOCH)
                     .expect("Time went backwards")
                     .as_secs();
-                if epoch > *expiration {
+                if epoch + EXPIRATION_BUFFER_SECONDS > *expiration {
                     debug!(%registry, %repository, ?op, %expiration, miss=false, expired=true, "Fetching token");
                     None
                 } else {
@@ -146,9 +149,5 @@ impl TokenCache {
                 None
             }
         }
-    }
-
-    pub(crate) fn contains_key(&self, reference: &Reference, op: RegistryOperation) -> bool {
-        self.get(reference, op).is_some()
     }
 }

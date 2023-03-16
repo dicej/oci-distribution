@@ -28,7 +28,11 @@ use serde::Serialize;
 use sha2::Digest;
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use std::ops::DerefMut;
+use tokio::{
+    io::{AsyncWrite, AsyncWriteExt},
+    sync::Mutex,
+};
 use tracing::{debug, trace, warn};
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
@@ -161,7 +165,7 @@ impl Config {
 /// unless you are sure that the remote registry does not require Oauth2.
 pub struct Client {
     config: ClientConfig,
-    tokens: TokenCache,
+    tokens: Mutex<TokenCache>,
     client: reqwest::Client,
     push_chunk_size: usize,
 }
@@ -170,7 +174,7 @@ impl Default for Client {
     fn default() -> Self {
         Self {
             config: ClientConfig::default(),
-            tokens: TokenCache::new(),
+            tokens: Mutex::new(TokenCache::new()),
             client: reqwest::Client::new(),
             push_chunk_size: PUSH_CHUNK_MAX_SIZE,
         }
@@ -209,7 +213,7 @@ impl TryFrom<ClientConfig> for Client {
 
         Ok(Self {
             config,
-            tokens: TokenCache::new(),
+            tokens: Mutex::new(TokenCache::new()),
             client: client_builder.build()?,
             push_chunk_size: PUSH_CHUNK_MAX_SIZE,
         })
@@ -224,7 +228,7 @@ impl Client {
             warn!("Creating client with default configuration");
             Self {
                 config: ClientConfig::default(),
-                tokens: TokenCache::new(),
+                tokens: Mutex::new(TokenCache::new()),
                 client: reqwest::Client::new(),
                 push_chunk_size: PUSH_CHUNK_MAX_SIZE,
             }
@@ -248,9 +252,6 @@ impl Client {
     ) -> Result<ImageData> {
         debug!("Pulling image: {:?}", image);
         let op = RegistryOperation::Pull;
-        if !self.tokens.contains_key(image, op) {
-            self.auth(image, auth, op).await?;
-        }
 
         let (manifest, digest, config) = self._pull_manifest_and_config(image).await?;
 
@@ -263,6 +264,7 @@ impl Client {
             // as &Self
             let this = &self;
             async move {
+                this.maybe_refresh_auth(image, auth, op).await?;
                 let mut out: Vec<u8> = Vec::new();
                 debug!("Pulling image layer");
                 this.pull_blob(image, &layer.digest, &mut out).await?;
@@ -284,6 +286,20 @@ impl Client {
         })
     }
 
+    /// Refresh required auth token if it's close to expiring.
+    pub async fn maybe_refresh_auth(
+        &self,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        op: RegistryOperation,
+    ) -> Result<()> {
+        let mut tokens = self.tokens.lock().await;
+        if tokens.get(reference, op).is_none() {
+            self.auth_internal(&mut tokens, reference, auth, op).await?;
+        }
+        Ok(())
+    }
+
     /// Push an image and return the uploaded URL of the image
     ///
     /// The client will check if it's already been authenticated and if
@@ -303,9 +319,6 @@ impl Client {
     ) -> Result<PushResponse> {
         debug!("Pushing image: {:?}", image_ref);
         let op = RegistryOperation::Push;
-        if !self.tokens.contains_key(image_ref, op) {
-            self.auth(image_ref, auth, op).await?;
-        }
 
         let manifest: OciImageManifest = match manifest {
             Some(m) => m,
@@ -317,6 +330,8 @@ impl Client {
             .map(|layer| {
                 let this = &self;
                 async move {
+                    this.maybe_refresh_auth(image_ref, auth, op).await?;
+
                     let digest = layer.sha256_digest();
                     match this
                         .push_blob_chunked(image_ref, &layer.data, &digest)
@@ -405,7 +420,23 @@ impl Client {
     /// This performs authorization and then stores the token internally to be used
     /// on other requests.
     pub async fn auth(
-        &mut self,
+        &self,
+        image: &Reference,
+        authentication: &RegistryAuth,
+        operation: RegistryOperation,
+    ) -> Result<()> {
+        self.auth_internal(
+            self.tokens.lock().await.deref_mut(),
+            image,
+            authentication,
+            operation,
+        )
+        .await
+    }
+
+    async fn auth_internal(
+        &self,
+        tokens: &mut TokenCache,
         image: &Reference,
         authentication: &RegistryAuth,
         operation: RegistryOperation,
@@ -429,7 +460,7 @@ impl Client {
             Err(e) => {
                 debug!(error = ?e, "Falling back to HTTP Basic Auth");
                 if let RegistryAuth::Basic(username, password) = authentication {
-                    self.tokens.insert(
+                    tokens.insert(
                         image,
                         operation,
                         RegistryTokenType::Basic(username.to_string(), password.to_string()),
@@ -472,8 +503,7 @@ impl Client {
                 let token: RegistryToken = serde_json::from_str(&text)
                     .map_err(|e| OciDistributionError::RegistryTokenDecodeError(e.to_string()))?;
                 debug!("Successfully authorized for image '{:?}'", image);
-                self.tokens
-                    .insert(image, operation, RegistryTokenType::Bearer(token));
+                tokens.insert(image, operation, RegistryTokenType::Bearer(token));
                 Ok(())
             }
             _ => {
@@ -498,15 +528,14 @@ impl Client {
         auth: &RegistryAuth,
     ) -> Result<String> {
         let op = RegistryOperation::Pull;
-        if !self.tokens.contains_key(image, op) {
-            self.auth(image, auth, op).await?;
-        }
+        self.maybe_refresh_auth(image, auth, op).await?;
 
         let url = self.to_v2_manifest_url(image);
         debug!("HEAD image manifest from {}", url);
         let res = RequestBuilderWrapper::from_client(self, |client| client.head(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .apply_auth(image, RegistryOperation::Pull)?
+            .apply_auth(image, RegistryOperation::Pull)
+            .await?
             .into_request_builder()
             .send()
             .await?;
@@ -516,7 +545,8 @@ impl Client {
             debug!("GET image manifest from {}", url);
             let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
                 .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-                .apply_auth(image, RegistryOperation::Pull)?
+                .apply_auth(image, RegistryOperation::Pull)
+                .await?
                 .into_request_builder()
                 .send()
                 .await?;
@@ -573,9 +603,7 @@ impl Client {
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String)> {
         let op = RegistryOperation::Pull;
-        if !self.tokens.contains_key(image, op) {
-            self.auth(image, auth, op).await?;
-        }
+        self.maybe_refresh_auth(image, auth, op).await?;
 
         self._pull_image_manifest(image).await
     }
@@ -593,9 +621,7 @@ impl Client {
         auth: &RegistryAuth,
     ) -> Result<(OciManifest, String)> {
         let op = RegistryOperation::Pull;
-        if !self.tokens.contains_key(image, op) {
-            self.auth(image, auth, op).await?;
-        }
+        self.maybe_refresh_auth(image, auth, op).await?;
 
         self._pull_manifest(image).await
     }
@@ -657,7 +683,8 @@ impl Client {
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .apply_auth(image, RegistryOperation::Pull)?
+            .apply_auth(image, RegistryOperation::Pull)
+            .await?
             .into_request_builder()
             .send()
             .await?;
@@ -712,9 +739,7 @@ impl Client {
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String, String)> {
         let op = RegistryOperation::Pull;
-        if !self.tokens.contains_key(image, op) {
-            self.auth(image, auth, op).await?;
-        }
+        self.maybe_refresh_auth(image, auth, op).await?;
 
         self._pull_manifest_and_config(image)
             .await
@@ -756,7 +781,8 @@ impl Client {
         auth: &RegistryAuth,
         manifest: OciImageIndex,
     ) -> Result<String> {
-        self.auth(reference, auth, RegistryOperation::Push).await?;
+        self.maybe_refresh_auth(reference, auth, RegistryOperation::Push)
+            .await?;
         self.push_manifest(reference, &OciManifest::ImageIndex(manifest))
             .await
     }
@@ -777,7 +803,8 @@ impl Client {
         let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), digest);
         let mut stream = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .apply_auth(image, RegistryOperation::Pull)?
+            .apply_auth(image, RegistryOperation::Pull)
+            .await?
             .into_request_builder()
             .send()
             .await?
@@ -797,7 +824,8 @@ impl Client {
         let url = &self.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_monolithical_session");
         let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
-            .apply_auth(image, RegistryOperation::Push)?
+            .apply_auth(image, RegistryOperation::Push)
+            .await?
             .into_request_builder()
             .send()
             .await?;
@@ -814,7 +842,8 @@ impl Client {
         let url = &self.to_v2_blob_upload_url(image);
         debug!(?url, "begin_push_session");
         let res = RequestBuilderWrapper::from_client(self, |client| client.post(url))
-            .apply_auth(image, RegistryOperation::Push)?
+            .apply_auth(image, RegistryOperation::Push)
+            .await?
             .into_request_builder()
             .header("Content-Length", 0)
             .send()
@@ -837,7 +866,8 @@ impl Client {
         let url = Url::parse_with_params(location, &[("digest", digest)])
             .map_err(|e| OciDistributionError::GenericError(Some(e.to_string())))?;
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
-            .apply_auth(image, RegistryOperation::Push)?
+            .apply_auth(image, RegistryOperation::Push)
+            .await?
             .into_request_builder()
             .header("Content-Length", 0)
             .send()
@@ -872,7 +902,8 @@ impl Client {
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(&url))
-            .apply_auth(image, RegistryOperation::Push)?
+            .apply_auth(image, RegistryOperation::Push)
+            .await?
             .into_request_builder()
             .headers(headers)
             .body(layer.to_vec())
@@ -923,7 +954,8 @@ impl Client {
         );
 
         let res = RequestBuilderWrapper::from_client(self, |client| client.patch(location))
-            .apply_auth(image, RegistryOperation::Push)?
+            .apply_auth(image, RegistryOperation::Push)
+            .await?
             .into_request_builder()
             .headers(headers)
             .body(body)
@@ -961,7 +993,8 @@ impl Client {
 
         debug!(?url, ?content_type, "push manifest");
         let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
-            .apply_auth(image, RegistryOperation::Push)?
+            .apply_auth(image, RegistryOperation::Push)
+            .await?
             .into_request_builder()
             .headers(headers)
             .body(body)
@@ -1176,14 +1209,14 @@ impl<'a> RequestBuilderWrapper<'a> {
     /// Authorization header. It will also set the Accept header, which must
     /// be set on all OCI Registry requests. If the struct has HTTP Basic Auth
     /// credentials, these will be configured.
-    fn apply_auth(
+    async fn apply_auth(
         &self,
         image: &Reference,
         op: RegistryOperation,
     ) -> Result<RequestBuilderWrapper> {
         let mut headers = HeaderMap::new();
 
-        if let Some(token) = self.client.tokens.get(image, op) {
+        if let Some(token) = self.client.tokens.lock().await.get(image, op) {
             match token {
                 RegistryTokenType::Bearer(token) => {
                     debug!("Using bearer token authentication.");
@@ -1522,7 +1555,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    #[tokio::test]
     fn test_apply_auth_no_token() -> anyhow::Result<()> {
         assert!(
             !RequestBuilderWrapper::from_client(&Client::default(), |client| client
@@ -1530,7 +1563,8 @@ mod test {
             .apply_auth(
                 &Reference::try_from(HELLO_IMAGE_TAG)?,
                 RegistryOperation::Pull
-            )?
+            )
+            .await?
             .into_request_builder()
             .build()?
             .headers()
@@ -1540,7 +1574,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    #[tokio::test]
     fn test_apply_auth_bearer_token() -> anyhow::Result<()> {
         use hmac::{Hmac, Mac};
         use jwt::SignWithKey;
@@ -1572,7 +1606,8 @@ mod test {
             .apply_auth(
                 &Reference::try_from(HELLO_IMAGE_TAG)?,
                 RegistryOperation::Pull
-            )?
+            )
+            .await?
             .into_request_builder()
             .build()?
             .headers()["Authorization"],
