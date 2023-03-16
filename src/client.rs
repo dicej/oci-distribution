@@ -18,7 +18,7 @@ use crate::Reference;
 use crate::errors::{OciDistributionError, Result};
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
 use futures_util::future;
-use futures_util::stream::StreamExt;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use http::HeaderValue;
 use http_auth::{parser::ChallengeParser, ChallengeRef};
 use olpc_cjson::CanonicalFormatter;
@@ -39,6 +39,8 @@ const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
 ];
 
 const PUSH_CHUNK_MAX_SIZE: usize = 4096 * 1024;
+
+const MAX_PARALLEL_PUSH: usize = 16;
 
 /// The data for an image or module.
 #[derive(Clone)]
@@ -311,22 +313,35 @@ impl Client {
         };
 
         // Upload layers
-        for layer in layers {
-            let digest = layer.sha256_digest();
-            match self
-                .push_blob_chunked(image_ref, &layer.data, &digest)
-                .await
-            {
-                Err(OciDistributionError::SpecViolationError(violation)) => {
-                    warn!(?violation, "Registry is not respecting the OCI Distribution Specification when doing chunked push operations");
-                    warn!("Attempting monolithic push");
-                    self.push_blob_monolithically(image_ref, &layer.data, &digest)
-                        .await?;
+        stream::iter(layers)
+            .map(|layer| {
+                let this = &self;
+                async move {
+                    let digest = layer.sha256_digest();
+                    match this
+                        .push_blob_chunked(image_ref, &layer.data, &digest)
+                        .await
+                    {
+                        Err(OciDistributionError::SpecViolationError(violation)) => {
+                            warn!(
+                                ?violation,
+                                "Registry is not respecting the OCI Distribution \
+                                       Specification when doing chunked push operations"
+                            );
+                            warn!("Attempting monolithic push");
+                            this.push_blob_monolithically(image_ref, &layer.data, &digest)
+                                .await?;
+                        }
+                        Err(e) => return Err(e),
+                        _ => {}
+                    };
+
+                    Ok(())
                 }
-                Err(e) => return Err(e),
-                _ => {}
-            };
-        }
+            })
+            .buffer_unordered(MAX_PARALLEL_PUSH)
+            .try_for_each(future::ok)
+            .await?;
 
         let config_url = match self
             .push_blob_chunked(image_ref, &config.data, &manifest.config.digest)
